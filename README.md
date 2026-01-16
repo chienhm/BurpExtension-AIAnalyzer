@@ -115,3 +115,15 @@ Organizes results hierarchically by **Protocol -> Domain -> Folder -> File**.
 **Important Note**: The quality, accuracy, and depth of the scan results are heavily dependent on the chosen **AI Model** and the effectiveness of your **Custom System Prompt**. Experimenting with different models and refining your prompt instructions can significantly improve the ability to find specific information.
 
 **Disclaimer**: This extension transmits HTTP response data to the configured AI provider (OpenRouter). Please ensure you comply with all data privacy requirements and engagement authorizations before sending target data to third-party services.
+
+---
+## Example
+<img width="1908" height="966" alt="image" src="https://github.com/user-attachments/assets/ceea3dc7-89eb-4eec-ab74-30d5eef91e27" />
+
+<img width="1911" height="975" alt="image" src="https://github.com/user-attachments/assets/2f0e0403-2acd-4066-bff5-2a345fd97d24" />
+
+<img width="1911" height="974" alt="image" src="https://github.com/user-attachments/assets/d925866f-9dce-4ded-be54-d42e2cdd0a98" />
+
+<img width="1643" height="900" alt="image" src="https://github.com/user-attachments/assets/d965b943-60f7-4fb2-919d-2a8b697dc29f" />
+
+<img width="1608" height="900" alt="image" src="https://github.com/user-attachments/assets/8ed49ddd-3b01-4635-a9eb-d87af923f2d8" />
