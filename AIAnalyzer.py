@@ -1468,6 +1468,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         cnt = self._result_tabs.getTabCount()
         if cnt > 0: self._result_tabs.setSelectedIndex(cnt - 1)
 
+    def _escape_html(self, text):
+        if not text: return ""
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
+
     # [MODIFIED] Compact UI with HTML & CSS - No Forced Wrapping
     def _add_tab_content(self, title, url, report_text, model_name="Unknown"):
         editor_pane = JEditorPane()
@@ -1497,8 +1501,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
         html = "<html><head><style>" + style + "</style></head><body>"
         html += "<div class='target-box'>"
-        html += "<b>TARGET:</b> " + url + "<br>"
-        html += "<b>MODEL:</b> " + model_name
+        html += "<b>TARGET:</b> " + self._escape_html(url) + "<br>"
+        html += "<b>MODEL:</b> " + self._escape_html(model_name)
         html += "</div>"
         
         html += self._render_markdown_to_html(report_text)
@@ -1533,7 +1537,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 continue
                 
             if in_code_block:
-                safe_line = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                safe_line = self._escape_html(line)
                 html += safe_line + "<br>"
                 continue
 
@@ -1548,21 +1552,21 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             if stripped.startswith("## ") or stripped.startswith("### "):
                 if in_list: html += "</ul>"; in_list = False
                 header_level = 2 if stripped.startswith("## ") else 3
-                content = stripped.lstrip("#").strip()
+                content = self._escape_html(stripped.lstrip("#").strip())
                 html += "<h{0}>{1}</h{0}>".format(header_level, content)
                 continue
                 
             # Alternative Header (Bold line: **Title**)
             if stripped.startswith("**") and stripped.endswith("**") and len(stripped) < 60:
                 if in_list: html += "</ul>"; in_list = False
-                content = stripped.strip("*").strip()
+                content = self._escape_html(stripped.strip("*").strip())
                 html += "<h2>" + content + "</h2>"
                 continue
 
             # Lists (* Item or - Item)
             if stripped.startswith("* ") or stripped.startswith("- "):
                 if not in_list: html += "<ul>"; in_list = True
-                content = stripped[2:]
+                content = self._escape_html(stripped[2:])
                 # Formatting within list items
                 content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', content) # Bold
                 content = re.sub(r'`(.*?)`', r'<span class="inline-code">\1</span>', content) # Inline Code
@@ -1572,7 +1576,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 if in_list: html += "</ul>"; in_list = False
 
             # Paragraphs
-            line_formatted = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line) # Bold
+            safe_line = self._escape_html(line)
+            line_formatted = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', safe_line) # Bold
             line_formatted = re.sub(r'`(.*?)`', r'<span class="inline-code">\1</span>', line_formatted) # Inline Code
             html += "<p>" + line_formatted + "</p>"
             
