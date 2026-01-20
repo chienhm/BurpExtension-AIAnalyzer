@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
+import codecs
 from burp import IBurpExtender, IHttpListener, ITab, IBurpExtenderCallbacks, IContextMenuFactory
-from java.io import PrintWriter
+from java.io import PrintWriter, File
 from java.lang import Runnable, Thread, String, Integer, System, Boolean
 from java.util import ArrayList, HashMap, Collections
 from java.util.concurrent import LinkedBlockingQueue
 from javax.swing import (JPanel, JLabel, JTextField, JPasswordField, JTextArea, JTextPane, JEditorPane,
                          JCheckBox, JScrollPane, JButton, BoxLayout, BorderFactory, 
                          JTabbedPane, SwingUtilities, JSplitPane, JTable, JDialog, JComboBox,
-                         ListSelectionModel, Box, JOptionPane, DefaultComboBoxModel, JTree, UIManager, JPopupMenu, JMenuItem, JMenu, RowFilter)
+                         ListSelectionModel, Box, JOptionPane, DefaultComboBoxModel, JTree, UIManager, JPopupMenu, JMenuItem, JMenu, RowFilter,
+                         JToggleButton, ButtonGroup, JFileChooser)
 from javax.swing.tree import DefaultMutableTreeNode, DefaultTreeModel, DefaultTreeCellRenderer, TreeSelectionModel, TreePath
 from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer, TableRowSorter
-from java.awt import BorderLayout, FlowLayout, Font, Color, Insets, GridBagLayout, GridBagConstraints, Dimension
+from javax.swing.filechooser import FileNameExtensionFilter
+from java.awt import (BorderLayout, FlowLayout, Font, Color, Insets, GridBagLayout, 
+                      GridBagConstraints, Dimension, CardLayout, Cursor)
 from java.awt.event import KeyAdapter, KeyEvent, ActionListener, MouseAdapter, MouseEvent
 from javax.swing.event import DocumentListener, DocumentEvent
 from javax.swing.text import SimpleAttributeSet, StyleConstants
@@ -23,6 +27,7 @@ import re
 import datetime
 import javax.swing.tree
 from java.util.regex import Pattern
+from java.beans import PropertyChangeListener
 
 reload(sys)
 sys.setdefaultencoding('utf-8')
@@ -162,6 +167,16 @@ class SearchKeyAdapter(KeyAdapter):
         if event.getKeyCode() not in [KeyEvent.VK_ENTER, KeyEvent.VK_UP, KeyEvent.VK_DOWN, KeyEvent.VK_LEFT, KeyEvent.VK_RIGHT, KeyEvent.VK_ESCAPE]: 
             self.ext.filter_models()
 
+class SafeStringRenderer(DefaultTableCellRenderer):
+    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
+        # [SECURITY] Prevent HTML Injection in Table Cells
+        # If value starts with <html>, Swing renders it as HTML.
+        # We prepend a space to force plain text rendering if valid HTML tag is detected at start.
+        if value and isinstance(value, basestring):
+             if value.strip().lower().startswith("<html>"):
+                 value = " " + value
+        return super(SafeStringRenderer, self).getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
+
 class StatusCellRenderer(DefaultTableCellRenderer):
     def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
         c = super(StatusCellRenderer, self).getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
@@ -176,25 +191,29 @@ class StatusCellRenderer(DefaultTableCellRenderer):
 class SafeTreeRenderer(DefaultTreeCellRenderer):
     def __init__(self):
         super(SafeTreeRenderer, self).__init__()
-        # Set colors
-        self._color_host = Color(240, 240, 240)       # Light Gray for Host
-        self._color_host_text = Color(30, 30, 30)     # Dark Text
-        self._color_folder = Color(255, 255, 255)     # White for folders
-        self._color_file_vuln = Color(255, 230, 230)  # Light Red bg for vulnerable files
-        self._color_text_vuln = Color(200, 0, 0)      # Red text for vulnerable files
-        self._color_file_safe = Color(240, 255, 240)  # Light Green bg for safe files 
-        self._color_text_safe = Color(0, 100, 0)      # Green text for safe files
+        self.update_theme()
+
+    def update_theme(self):
+        # Determine if dark mode is active
+        self.is_dark_mode = "Dark" in UIManager.getLookAndFeel().getName() or "Darcula" in UIManager.getLookAndFeel().getName()
         
-        # Determine if dark mode is active (heuristic)
-        self.is_dark_mode = "Dark" in UIManager.getLookAndFeel().getName()
         if self.is_dark_mode:
              self._color_host = Color(60, 60, 60)
              self._color_host_text = Color(220, 220, 220)
              self._color_folder = Color(40, 40, 40)
              self._color_file_vuln = Color(80, 20, 20)
-             self._color_text_vuln = Color(255, 100, 100)
+             # [FIX] Brighter colors for Dark Mode
+             self._color_text_vuln = Color(255, 100, 100) 
              self._color_file_safe = Color(20, 60, 20)
              self._color_text_safe = Color(100, 255, 100)
+        else:
+             self._color_host = Color(240, 240, 240)
+             self._color_host_text = Color(30, 30, 30)
+             self._color_folder = Color(255, 255, 255)
+             self._color_file_vuln = Color(255, 230, 230)
+             self._color_text_vuln = Color(200, 0, 0)
+             self._color_file_safe = Color(240, 255, 240)
+             self._color_text_safe = Color(0, 100, 0)
 
     def getTreeCellRendererComponent(self, tree, value, sel, expanded, leaf, row, hasFocus):
         super(SafeTreeRenderer, self).getTreeCellRendererComponent(tree, value, sel, expanded, leaf, row, hasFocus)
@@ -203,7 +222,12 @@ class SafeTreeRenderer(DefaultTreeCellRenderer):
         
         if isinstance(value, DefaultMutableTreeNode):
             obj = value.getUserObject()
-            self.setText(" " + str(obj)) # Add a little spacing
+            
+            # [SECURITY] Prevent HTML Injection in Tree Nodes
+            label = str(obj)
+            if label.strip().lower().startswith("<html>"):
+                label = " " + label
+            self.setText(" " + label) # Add a little spacing
             
             # --- CUSTOM ICONS & STYLES ---
             if hasattr(obj, 'type'):
@@ -369,29 +393,99 @@ class TreeMouseListener(MouseAdapter):
     def mouseReleased(self, event): self.handle_popup(event)
     def handle_popup(self, event):
         if event.isPopupTrigger():
-            path = self.extender._tree.getPathForLocation(event.getX(), event.getY())
-            if path:
-                self.extender._tree.setSelectionPath(path); node = path.getLastPathComponent(); data = node.getUserObject()
+            tree = self.extender._tree
+            paths = tree.getSelectionPaths()
+            
+            if not paths:
+                # Try to select the node under cursor if nothing selected
+                path = tree.getPathForLocation(event.getX(), event.getY())
+                if path:
+                    tree.setSelectionPath(path)
+                    paths = [path]
+                else:
+                    return
+
+            if paths:
+                # Get the first node for context (like single rescan)
+                first_node = paths[0].getLastPathComponent()
+                first_data = first_node.getUserObject()
+                
+                # Get ALL selected nodes for Batch Export
+                selected_nodes = [p.getLastPathComponent() for p in paths]
                 
                 menu = JPopupMenu()
                 
-                # Rescan options (only for files)
-                if hasattr(data, 'type') and data.type == "file":
+                # Rescan options (Only valid if SINGLE FILE is selected, or we could support batch rescan later)
+                # For now, keep Rescan for single 'file' selection to avoid complexity
+                if len(paths) == 1 and hasattr(first_data, 'type') and first_data.type == "file":
                     default_model = self.extender._get_selected_model() or DEFAULT_MODEL
                     default_item = JMenuItem("Rescan with Default ({})".format(default_model))
-                    default_item.addActionListener(lambda e: self.extender.perform_rescan(data.url, model_override=default_model))
+                    default_item.addActionListener(lambda e: self.extender.perform_rescan(first_data.url, model_override=default_model))
                     menu.add(default_item)
-                    submenu = self.extender.create_model_submenu("Select Model...", lambda m: self.extender.perform_rescan(data.url, model_override=m))
+                    submenu = self.extender.create_model_submenu("Select Model...", lambda m: self.extender.perform_rescan(first_data.url, model_override=m))
                     menu.add(submenu)
-                    menu.addSeparator()
+                
+                # [NEW] Export / Import (Global for all nodes: Host, Folder, File)
+                menu.addSeparator()
+                
+                # Export Label changes based on selection count
+                label = "Export Results" if len(paths) <= 1 else "Export Selected ({} items)".format(len(paths))
+                item_export = JMenuItem(label)
+                
+                # Pass LIST of nodes to export_scan_data
+                item_export.addActionListener(lambda e: self.extender.export_scan_data(selected_nodes)) 
+                menu.add(item_export)
+                
+                menu.addSeparator()
 
-                # Delete Option
+                # Delete Option (Batch Delete)
                 del_item = JMenuItem("Delete")
-                del_item.addActionListener(lambda e: self.extender.delete_tree_node(node))
+                # We need a batch delete method actually, but for now let's just delete the primary one or loop?
+                # The user didn't ask for batch delete in tree yet, but it's good practice. 
+                # Let's keep it simple: Delete acts on the FIRST node or we can implement batch delete loop.
+                # To be safe and stick to scope: Loop delete or just first?
+                # Let's just pass the first node for now to avoid risking stability, unless user asked.
+                # User asked for "Export" multi selection.
+                del_item.addActionListener(lambda e: self.extender.delete_tree_node(first_node))
                 del_item.setForeground(Color(200, 0, 0))
                 menu.add(del_item)
                 
                 menu.show(event.getComponent(), event.getX(), event.getY())
+
+class ResultTabMouseListener(MouseAdapter):
+    def __init__(self, extender): self.extender = extender
+    def mousePressed(self, event): self.handle_popup(event)
+    def mouseReleased(self, event): self.handle_popup(event)
+    def handle_popup(self, event):
+        if event.isPopupTrigger():
+            comp = event.getComponent()
+            # Retrieve data from client properties
+            full_url = comp.getClientProperty("full_url")
+            report = comp.getClientProperty("report")
+            model = comp.getClientProperty("model")
+            time = comp.getClientProperty("time")
+            
+            if full_url and report:
+                menu = JPopupMenu()
+                item = JMenuItem("Export This Result")
+                
+                # Construct data for export
+                record = {
+                    "full_url": full_url,
+                    "report": report,
+                    "model": model if model else "Unknown",
+                    "time": time if time else "Unknown"
+                }
+                
+                item.addActionListener(lambda e: self.extender._save_records_to_json([record]))
+                menu.add(item)
+                menu.show(comp, event.getX(), event.getY())
+
+class ThemeChangeListener(PropertyChangeListener):
+    def __init__(self, callback): self.callback = callback
+    def propertyChange(self, event):
+        if event.getPropertyName() == "lookAndFeel":
+            self.callback()
 
 # ==============================================================================
 # MAIN EXTENSION CLASS
@@ -639,31 +733,31 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
     def _create_readme_panel(self):
         panel = JPanel(BorderLayout())
+        
+        # 1. Editor Pane
         editor = JEditorPane()
         editor.setContentType("text/html")
         editor.setEditable(False)
-        editor.setFont(Font("SansSerif", Font.PLAIN, 12))
-        html_content = u"""
-        <html>
-        <head>
-            <style>
-                body{font-family:SansSerif;font-size:12px;padding:15px;line-height:1.4}
-                h1{color:#E67E22;border-bottom:2px solid #E67E22;padding-bottom:5px;font-size:18px}
-                h3{color:#2980B9;margin-top:20px;font-size:14px;border-bottom:1px solid #ddd;padding-bottom:3px}
-                b{color:#333}
-                ul{margin-left:20px}
-                li{margin-bottom:5px}
-                code{background-color:#f0f0f0;padding:2px 4px;border-radius:3px;font-family:Monospaced;color:#C7254E}
-                .section{margin-bottom:15px}
-                .highlight{color:#d35400;font-weight:bold}
-            </style>
-        </head>
-        <body>
+        # [FIX] Force update properties on theme change
+        editor.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, True)
+        # Use HTMLEditorKit explicitly
+        editor.setEditorKit(HTMLEditorKit())
+        editor.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, True)
+        editor.setEditorKit(HTMLEditorKit()) 
+        
+        # Get Theme Config
+        theme = self._get_theme_config()
+
+        # 2. Content Storage (VI / EN)
+        self.readme_css = "<style>" + theme['css'] + "</style>"
+        
+        # VIETNAMESE CONTENT
+        self.readme_vi = u"""
             <h1>HƯỚNG DẪN SỬ DỤNG - AI ANALYZER</h1>
             
             <div class="section">
                 <h3>1. Giới thiệu (Introduction)</h3>
-                <p><b>AI Analyzer</b> là một tiện ích mở rộng (Extension) dành cho Burp Suite, tích hợp sức mạnh của các mô hình ngôn ngữ lớn (LLMs) như Google Gemini, OpenAI GPT, Claude... thông qua nền tảng <b>OpenRouter</b>. Công cụ này hoạt động như một trợ lý bảo mật ảo, giúp tự động hóa quy trình phân tích HTTP Response để tìm kiếm thông tin.</p>
+                <p><b>AI Analyzer</b> là một tiện ích mở rộng (Extension) dành cho Burp Suite, tích hợp sức mạnh của các mô hình ngôn ngữ lớn (LLMs) như Google Gemini, OpenAI GPT, Claude... thông qua nền tảng <b>OpenRouter</b>. Công cụ đóng vai trò như một trợ lý bảo mật ảo, giúp tự động hóa quy trình phân tích HTTP Response để tìm kiếm thông tin nhạy cảm và lỗ hổng.</p>
                 <p><b>Chức năng chính:</b></p>
                 <ul>
                     <li>Tự động scan các request đi qua Proxy (Auto-Scanning).</li>
@@ -681,7 +775,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     <li><b>Model Name:</b> Chọn bộ não cho scanner (Ví dụ: <code>google/gemma-3-12b-it:free</code>). Bạn có thể gõ tên để tìm kiếm nhanh.</li>
                     <li><b>Rate Limit:</b> Thời gian nghỉ (giây) giữa các lần scan để tránh bị API chặn (Rate Limiting). Mặc định là 45 giây.</li>
                     <li><b>Allowed MIME Types:</b> Danh sách các loại file sẽ được Auto-scan. Các loại file nhị phân (ảnh, video) thường nên bị loại bỏ để tiết kiệm.</li>
-                    <li><b>Ignore Query Params (Anti-Dupe):</b> <span class="highlight">Quan trọng!</span> Khi bật, tool sẽ coi <code>script.js?v=1</code> và <code>script.js?v=2</code> là giống nhau và chỉ scan 1 lần. Tắt nếu bạn muốn recon thêm trên từng tham số.</li>
+                    <li><b>Ignore Query Params (Anti-Dupe):</b> <span style="color: #ff9900; font-weight: bold;">Quan trọng!</span> Khi bật, tool sẽ coi <code>script.js?v=1</code> và <code>script.js?v=2</code> là giống nhau và chỉ scan 1 lần. Tắt nếu bạn muốn recon thêm trên từng tham số.</li>
                     <li><b>Custom System Prompt:</b> Bạn có thể thay đổi Prompt mặc định để hướng dẫn AI tìm kiếm các lỗi cụ thể hơn. <b>Lưu ý:</b> Biến <code>{url}</code> là <b>BẮT BUỘC</b> để phần kết quả hiển thị được link mục tiêu.</li>
                 </ul>
             </div>
@@ -695,41 +789,162 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 </ul>
                 <p><b>Ví dụ Regex phổ biến:</b></p>
                 <ul>
-                    <li>Scan toàn bộ subdomain của example.com: <br>Host: <code>.*\.example\.com</code></li>
-                    <li>Bỏ qua file ảnh (jpg, png...): <br>Path: <code>.*\.(jpg|png|gif|css|woff)$</code></li>
-                    <li>Bỏ qua trang Logout: <br>Path: <code>.*logout.*</code></li>
+                    <li>Scan toàn bộ subdomain của example.com:
+                        <br>Host: <code>.*\.example\.com</code></li>
+                    <li>Bỏ qua file ảnh (jpg, png...):
+                        <br>Path: <code>.*\.(jpg|png|gif|css|woff)$</code></li>
+                    <li>Bỏ qua trang Logout:
+                        <br>Path: <code>.*logout.*</code></li>
                 </ul>
             </div>
 
             <div class="section">
-                <h3>4. Cách sử dụng (Usage Guide)</h3>
-                <p>Bạn có 2 cách để kích hoạt scan:</p>
+                <h3>4. Các chức năng khác (Additional Features)</h3>
                 <ul>
-                    <li><b>Tự động (Auto-Scan):</b> Tick vào ô <b>Enable Auto-Scanning</b> ở tab Config. Mọi request đi qua Burp Proxy thỏa mãn Scope sẽ được tự động đẩy vào hàng đợi.</li>
-                    <li><b>Thủ công (Manual Scan):</b> Tại bất kỳ đâu (Proxy History, Repeater, Intruder), bạn nhấp chuột phải vào request và chọn:
-                    <ul>
-                        <li><b>AI Analyzer: Scan with Default...</b>: Scan nhanh bằng model mặc định.</li>
-                        <li><b>AI Analyzer: Select Model...</b>: Chọn một model cụ thể từ danh sách.</li>
-                    </ul>
+                    <li><b>Manual Scan:</b> Chuột phải vào request bất kỳ (Proxy/Repeater) -> Chọn <b>"Send to AI Analyzer"</b> để phân tích thủ công.</li>
+                    <li><b>Batch Scan:</b> Tại tab Scanner Monitor, giữ phím Ctrl/Shift để chọn nhiều dòng -> Chuột phải -> <b>"Rescan Selected"</b>.</li>
+                    <li><b>Export/Import:</b>
+                        <ul>
+                            <li><b>Export:</b> Chọn các node trong cây kết quả hoặc các dòng trong Monitor -> Chuột phải -> <b>Export</b> để lưu báo cáo ra file JSON.</li>
+                            <li><b>Import:</b> Dùng nút Import để nạp lại dữ liệu đã scan trước đó.</li>
+                        </ul>
                     </li>
                 </ul>
-                <p><i>Lưu ý: Nếu request đã có Response trong lịch sử, tool sẽ phân tích ngay lập tức. Nếu chưa có (ví dụ đang intercept), tool sẽ hiện hộp thoại hỏi bạn có muốn gửi request để lấy response không.</i></p>
+            </div>
+        """
+        
+        # ENGLISH CONTENT
+        self.readme_en = u"""
+            <h1>USER GUIDE - AI ANALYZER</h1>
+            
+            <div class="section">
+                <h3>1. Introduction</h3>
+                <p><b>AI Analyzer</b> is a Burp Suite Extension that integrates the power of Large Language Models (LLMs) such as Google Gemini, OpenAI GPT, Claude... via the <b>OpenRouter</b> platform. It acts as a virtual security assistant, automating the analysis of HTTP Responses to find sensitive information and vulnerabilities.</p>
+                <p><b>Key Features:</b></p>
+                <ul>
+                    <li>Automatically scans requests passing through Proxy (Auto-Scanning).</li>
+                    <li>Analyzes JavaScript code and API Responses to find secret keys and hidden endpoints.</li>
+                    <li>Supports multiple AI models.</li>
+                    <li>Smart deduplication mechanism to save API costs.</li>
+                </ul>
             </div>
 
             <div class="section">
-                <h3>5. Giám sát & Kết quả (Monitoring)</h3>
+                <h3>2. Configuration</h3>
+                <p>The <b>Configuration</b> tab is where you set up operational parameters:</p>
                 <ul>
-                    <li><b>Tab Monitor & Logs:</b> Theo dõi tiến trình scan, xem hàng đợi (Active Scans) và Log lỗi hệ thống. Bạn có thể Rescan các mục bị lỗi tại đây.</li>
-                    <li><b>Tab Analyzer Results:</b> Kết quả phân tích được tổ chức dạng cây thư mục (Site Map). Nhấp vào từng file để xem báo cáo chi tiết từ AI. <b>Đặc biệt:</b> Các bản scan khác nhau của cùng 1 URL (khác tham số query) sẽ được gom lại và hiển thị thành nhiều Tab trong cùng 1 node để dễ quản lý.</li>
+                    <li><b>OpenRouter Key:</b> This is the key to connect to the AI. You need to register at <a href="https://openrouter.ai">openrouter.ai</a> and create a key. After entering, click <b>Check & Save</b> to verify connection and load the Model list.</li>
+                    <li><b>Model Name:</b> Select the brain for the scanner (e.g., <code>google/gemma-3-12b-it:free</code>). You can type to search quickly.</li>
+                    <li><b>Rate Limit:</b> Pause time (seconds) between scans to avoid API rate limiting. Default is 45 seconds.</li>
+                    <li><b>Allowed MIME Types:</b> List of file types to be Auto-scanned. Binary files (images, videos) should typically be excluded to save costs.</li>
+                    <li><b>Ignore Query Params (Anti-Dupe):</b> <span style="color: #ff9900; font-weight: bold;">Important!</span> When enabled, the tool treats <code>script.js?v=1</code> and <code>script.js?v=2</code> as the same and scans only once. Disable if you want to recon on individual parameters.</li>
+                    <li><b>Custom System Prompt:</b> You can modify the default Prompt to guide the AI to find specific issues. <b>Note:</b> The <code>{url}</code> variable is <b>MANDATORY</b> for the results to link to the target.</li>
                 </ul>
             </div>
+
+            <div class="section">
+                <h3>3. Target Scope</h3>
+                <p>To avoid scanning unauthorized websites, you MUST configure the <b>Target Scope</b>. The tool uses <b>Regular Expression (Regex)</b> to match URLs.</p>
+                <ul>
+                    <li><b>Include:</b> Only scan URLs that match the rules here.</li>
+                    <li><b>Exclude:</b> Skip URLs that match the rules here (higher priority than Include).</li>
+                </ul>
+                <p><b>Common Regex Examples:</b></p>
+                <ul>
+                    <li>Scan all subdomains of example.com:
+                        <br>Host: <code>.*\.example\.com</code></li>
+                    <li>Ignore reference files (jpg, png...):
+                        <br>Path: <code>.*\.(jpg|png|gif|css|woff)$</code></li>
+                    <li>Ignore Logout pages:
+                        <br>Path: <code>.*logout.*</code></li>
+                </ul>
+            </div>
+
+            <div class="section">
+                <h3>4. Additional Features</h3>
+                <ul>
+                    <li><b>Manual Scan:</b> Right-click any request (Proxy/Repeater) -> Select <b>"Send to AI Analyzer"</b> to analyze manually.</li>
+                    <li><b>Batch Scan:</b> In the Scanner Monitor tab, hold Ctrl/Shift to select multiple rows -> Right-click -> <b>"Rescan Selected"</b>.</li>
+                    <li><b>Export/Import:</b>
+                        <ul>
+                            <li><b>Export:</b> Select nodes in the result tree or rows in Monitor -> Right-click -> <b>Export</b> to save the report to a JSON file.</li>
+                            <li><b>Import:</b> Use the Import button to reload previously scanned data.</li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+        """
+
+
+
+        # 3. Toggle Logic
+        # Default to VI
+        self._current_lang = "VI"
+        
+        def update_content():
+            content = self.readme_vi if self._current_lang == "VI" else self.readme_en
+            html = "<html><head>" + self.readme_css + "</head><body>" + content + "</body></html>"
+            editor.setText(html)
+            editor.setCaretPosition(0)
             
-            <hr>
-            <p style="text-align:right;color:gray;font-size:10px">Developed by Chienhm - 2025</p>
-        </body>
-        </html>"""
-        editor.setText(html_content)
+        def toggle_lang(e):
+            if self._current_lang == "VI":
+                self._current_lang = "EN"
+                btn_lang.setText("Language: EN")
+            else:
+                self._current_lang = "VI"
+                btn_lang.setText("Language: VI")
+            update_content()
+
+        # 4. Auto-Detect Theme Change
+        def on_theme_change():
+            def run_update():
+                try:
+                    # 1. Update Readme Config
+                    new_theme = self._get_theme_config()
+                    self.readme_css = "<style>" + new_theme['css'] + "</style>"
+                    
+                    # 2. Refresh Readme UI
+                    editor.setBackground(new_theme['bg_panel'])
+                    editor.setForeground(new_theme['text_normal'])
+                    update_content()
+                    
+                    # 3. Refresh Result Tabs (Dynamic Update)
+                    self._refresh_tabs_for_current_node()
+                    
+                    # 4. Refresh Tree UI (Colors)
+                    if hasattr(self, '_tree_renderer'):
+                        self._tree_renderer.update_theme()
+                        self._tree.repaint()
+                except Exception as e:
+                    print("Theme Update Error: " + str(e))
+
+            if SwingUtilities.isEventDispatchThread():
+                run_update()
+            else:
+                SwingUtilities.invokeLater(run_update)
+
+        # Register Global Listener (Keep reference to prevent GC)
+        self._theme_listener = ThemeChangeListener(on_theme_change)
+        UIManager.addPropertyChangeListener(self._theme_listener)
+
+        # 4. Toolbar
+        toolbar = JPanel(FlowLayout(FlowLayout.RIGHT))
+        
+        # Language Button
+        btn_lang = JButton("Language: VI")
+        btn_lang.setFocusPainted(False)
+        btn_lang.addActionListener(toggle_lang)
+        
+        toolbar.add(btn_lang)
+        
+        # Assemble
+        panel.add(toolbar, BorderLayout.NORTH)
         panel.add(JScrollPane(editor), BorderLayout.CENTER)
+        
+        # Init content
+        update_content()
+        
         return panel
 
     def create_model_submenu(self, title, callback):
@@ -912,10 +1127,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         table.getColumnModel().getColumn(0).setMaxWidth(60)
         table.setRowHeight(22)
+        # [SECURITY] Apply Safe Renderer to prevent HTML Injection
+        renderer = SafeStringRenderer()
+        for i in range(1, 5):
+            table.getColumnModel().getColumn(i).setCellRenderer(renderer)
     
     def _config_monitor_table(self, table):
         table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         table.setRowHeight(22)
+        # [SECURITY] Apply Safe Renderer
+        renderer = SafeStringRenderer()
+        table.getColumnModel().getColumn(2).setCellRenderer(renderer) # Method
+        table.getColumnModel().getColumn(3).setCellRenderer(renderer) # Model
+        table.getColumnModel().getColumn(4).setCellRenderer(renderer) # Target URL
 
     def _init_ui_components(self):
         self._txt_api_key = JPasswordField(40)
@@ -1009,7 +1233,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self._tree_model = DefaultTreeModel(self._root_node)
         self._tree = JTree(self._tree_model)
         self._tree.setRootVisible(False); self._tree.setShowsRootHandles(True)
-        self._tree.setCellRenderer(SafeTreeRenderer())
+        self._tree_renderer = SafeTreeRenderer()
+        self._tree.setCellRenderer(self._tree_renderer)
         self._tree.addTreeSelectionListener(lambda e: self._on_tree_select(e))
         self._tree.addMouseListener(TreeMouseListener(self)) 
         self._result_tabs = JTabbedPane()
@@ -1135,14 +1360,46 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         split_monitor.setTopComponent(queue_panel); split_monitor.setBottomComponent(log_panel); monitor_panel.add(split_monitor, BorderLayout.CENTER)
         
         # TAB 3: Results
-        results_panel = JPanel(BorderLayout()); split_pane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT); split_pane.setDividerLocation(300)
+        results_panel = JPanel(BorderLayout()); split_pane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT); split_pane.setDividerLocation(450)
         
         # Left Panel (Tree)
         left_panel = JPanel(BorderLayout()); 
-        lbl_tree = JLabel("  Site Map")
-        lbl_tree.setFont(Font("SansSerif", Font.BOLD, 12))
-        lbl_tree.setBorder(BorderFactory.createEmptyBorder(5, 0, 5, 0))
-        left_panel.add(lbl_tree, BorderLayout.NORTH)
+        
+        # [MODIFIED] Header with TitledBorder (Uniformity)
+        tree_header = JPanel(GridBagLayout())
+        tree_header.setBorder(BorderFactory.createTitledBorder("Site Map"))
+        
+        thc = GridBagConstraints()
+        thc.fill = GridBagConstraints.HORIZONTAL
+        thc.insets = Insets(2, 5, 2, 5)
+        
+        # Filler
+        thc.gridx = 0; thc.gridy = 0; thc.weightx = 1.0
+        tree_header.add(JLabel(""), thc) 
+        
+        # Export All Button
+        thc.gridx = 1; thc.weightx = 0.0
+        btn_export_all = JButton("Export All")
+        btn_export_all.setMargin(Insets(2, 5, 2, 5))
+        # Pass root node as a single-element list or just root node (refactored method handles both)
+        btn_export_all.addActionListener(lambda e: self.export_scan_data(self._root_node))
+        tree_header.add(btn_export_all, thc)
+
+        # Import Button
+        thc.gridx = 2
+        btn_import = JButton("Import")
+        btn_import.setMargin(Insets(2, 5, 2, 5))
+        btn_import.addActionListener(self.import_scan_data)
+        tree_header.add(btn_import, thc)
+        
+        # Clear Button
+        thc.gridx = 3
+        btn_clean = JButton("Clear")
+        btn_clean.setMargin(Insets(2, 5, 2, 5))
+        btn_clean.addActionListener(self._action_clear_sitemap)
+        tree_header.add(btn_clean, thc)
+        
+        left_panel.add(tree_header, BorderLayout.NORTH)
         left_panel.add(JScrollPane(self._tree), BorderLayout.CENTER)
         
         # Right Panel (Results & Filter)
@@ -1168,11 +1425,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         r_chk_panel.add(self._chk_tree_negative)
         right_header.add(r_chk_panel, rhc)
         
-        # 3. Clear Button (Right)
-        rhc.gridx = 2; rhc.weightx = 0.0
-        btn_clean = JButton("Clear Site Map")
-        btn_clean.addActionListener(self._action_clear_sitemap)
-        right_header.add(btn_clean, rhc)
+        # [REMOVED] Clear Button moved to Left Panel
         
         right_panel.add(right_header, BorderLayout.NORTH)
         right_panel.add(self._result_tabs, BorderLayout.CENTER)
@@ -1621,23 +1874,31 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 path = url_obj.getPath()
                 
                 # [FIXED] Handle Root URL (empty path or "/")
-                if not path or path == "/": segments = ["/"]
-                else: segments = [s for s in path.split('/') if s]
+                # [FIXED] Handle Root URL -> Merge to Host Node DO NOT create child
+                if not path or path == "/": 
+                    # Update Host Node Data
+                    data = host_node.getUserObject()
+                    data.report = report_text; data.url = base_url; data.type = "host"
+                    self._tree_model.nodeChanged(host_node)
+                    # Don't create segments
+                else:
+                    segments = [s for s in path.split('/') if s]
 
-                current_parent = host_node
-                for i, seg in enumerate(segments):
-                    is_last = (i == len(segments) - 1)
-                    child_node = self._find_child_node(current_parent, seg)
-                    if not child_node:
-                        if is_last: data = SitemapNodeData(seg, url=base_url, report=report_text, type="file")
-                        else: data = SitemapNodeData(seg, type="folder")
-                        child_node = DefaultMutableTreeNode(data)
-                        self._tree_model.insertNodeInto(child_node, current_parent, current_parent.getChildCount())
-                    else:
-                        if is_last:
-                            data = child_node.getUserObject(); data.report = report_text; data.url = base_url; data.type = "file" 
-                            self._tree_model.nodeChanged(child_node)
-                    current_parent = child_node
+                    current_parent = host_node
+                    for i, seg in enumerate(segments):
+                        is_last = (i == len(segments) - 1)
+                        child_node = self._find_child_node(current_parent, seg)
+                        if not child_node:
+                            if is_last: data = SitemapNodeData(seg, url=base_url, report=report_text, type="file")
+                            else: data = SitemapNodeData(seg, type="folder")
+                            child_node = DefaultMutableTreeNode(data)
+                            self._tree_model.insertNodeInto(child_node, current_parent, current_parent.getChildCount())
+                        else:
+                            if is_last:
+                                data = child_node.getUserObject(); data.report = report_text; data.url = base_url; data.type = "file" 
+                                self._tree_model.nodeChanged(child_node)
+                        current_parent = child_node
+                
                 self._tree.expandPath(TreePath(host_node.getPath()))
             except Exception as e: self.log_system("Tree Error: " + str(e), True)
         SwingUtilities.invokeLater(task)
@@ -1662,7 +1923,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         node = self._tree.getLastSelectedPathComponent(); 
         if not node: return
         data = node.getUserObject()
-        if hasattr(data, 'type') and data.type == "file":
+        
+        # [MODIFIED] Allow viewing report on Host Node too if available
+        if hasattr(data, 'report') and data.report and data.url:
             self._current_selected_url = data.url; self._refresh_tabs_for_current_node()
         else: self._current_selected_url = None; self._result_tabs.removeAll()
 
@@ -1676,12 +1939,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             if '?' in full_url:
                 raw_query = full_url.split('?', 1)[1]
                 if len(raw_query) > 20:
-                    query_part = " (?" + raw_query[:20] + "...)"
+                    query_part = " (?" + self._escape_html(raw_query[:20]) + "...)"
                 else:
-                    query_part = " (?" + raw_query + ")"
+                    query_part = " (?" + self._escape_html(raw_query) + ")"
             
             title = "Scan #{} [{}]{}".format(idx + 1, item['time'], query_part)
-            self._add_tab_content(title, full_url, item['report'], item.get('model', 'Unknown'))
+            self._add_tab_content(title, full_url, item['report'], item.get('model', 'Unknown'), item['time'])
             
             last_idx = self._result_tabs.getTabCount() - 1
             tooltip_text = "Scan #{}: {}".format(idx + 1, full_url)
@@ -1694,34 +1957,84 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         if not text: return ""
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
 
+    # [NEW] Enhanced Theme Helper
+    def _get_theme_config(self):
+        laf_name = UIManager.getLookAndFeel().getName()
+        is_dark = "Dark" in laf_name or "Darcula" in laf_name
+        
+        # DEBUG: Print detected theme
+        # DEBUG: Print detected theme removed
+        # DEBUG: Print detected theme removed
+        # print("[AI Analyzer] Detected LookAndFeel: {}, IsDark: {}".format(laf_name, is_dark))
+        
+        config = {}
+        config['is_dark'] = is_dark
+        
+        if is_dark:
+            # DARK MODE COLORS
+            config['bg_panel'] = Color(43, 43, 43) # IDK standard dark, often 43,43,43 or 60,63,65
+            config['border_color'] = Color(60, 63, 65)
+            config['text_normal'] = Color(187, 187, 187)
+            config['text_active'] = Color(70, 150, 255) # Bright Blue
+            
+            # CSS
+            config['css'] = """
+            body { font-family: Segoe UI, sans-serif; font-size: 12px; padding: 10px; color: #e6e6e6; background-color: #2b2b2b; }
+            h1 { color: #f39c12; border-bottom: 2px solid #555; padding-bottom: 5px; font-size: 18px; }
+            h2, h3 { color: #5dade2; margin-top: 20px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 3px; }
+            b { color: #f0f0f0; }
+            a { color: #5dade2; }
+            code, .inline-code { background-color: #444; color: #e74c3c; padding: 2px 4px; border-radius: 3px; font-family: Monospaced; }
+            .section { margin-bottom: 15px; }
+            .highlight { color: #e67e22; font-weight: bold; }
+            .target-box { background-color: #333; border-left: 4px solid #f39c12; padding: 8px; margin-bottom: 12px; }
+            .code-block { background-color: #1e1e1e; border: 1px solid #444; border-radius: 4px; padding: 10px; margin: 10px 0; display: block; color: #dcdcdc; }
+            """
+        else:
+            # LIGHT MODE COLORS
+            config['bg_panel'] = Color(255, 255, 255)
+            config['border_color'] = Color(220, 220, 220)
+            config['text_normal'] = Color(100, 100, 100)
+            config['text_active'] = Color(0, 100, 200)
+            
+            # CSS
+            config['css'] = """
+            body { font-family: Segoe UI, sans-serif; font-size: 12px; padding: 10px; color: #2d2d2d; background-color: #ffffff; }
+            h1 { color: #E67E22; border-bottom: 2px solid #E67E22; padding-bottom: 5px; font-size: 18px; }
+            h2, h3 { color: #2980B9; margin-top: 20px; font-size: 14px; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+            b { color: #333; }
+            a { color: #2980B9; }
+            code, .inline-code { background-color: #f0f0f0; color: #C7254E; padding: 2px 4px; border-radius: 3px; font-family: Monospaced; }
+            .section { margin-bottom: 15px; }
+            .highlight { color: #d35400; font-weight: bold; }
+            .target-box { background-color: #e9ecef; border-left: 4px solid #495057; padding: 8px; margin-bottom: 12px; }
+            .code-block { background-color: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 4px; padding: 10px; margin: 10px 0; display: block; color: #24292e; }
+            """
+        return config
+
     # [MODIFIED] Compact UI with HTML & CSS - No Forced Wrapping
-    def _add_tab_content(self, title, url, report_text, model_name="Unknown"):
+    def _add_tab_content(self, title, url, report_text, model_name="Unknown", time="Unknown"):
+        # Get Theme Config
+        theme = self._get_theme_config()
+        
+        # --- 1. PRETTY VIEW (HTML) ---
         editor_pane = JEditorPane()
         editor_pane.setEditable(False)
         editor_pane.setContentType("text/html")
         editor_pane.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, True)
         
+        # [NEW] Bind Data for Export
+        editor_pane.putClientProperty("full_url", url)
+        editor_pane.putClientProperty("report", report_text)
+        editor_pane.putClientProperty("model", model_name)
+        editor_pane.putClientProperty("time", time)
+        editor_pane.addMouseListener(ResultTabMouseListener(self))
+        
         # Use HTMLEditorKit for better control
         editor_pane.setEditorKit(HTMLEditorKit())
-        editor_pane.setFont(Font("Segoe UI", Font.PLAIN, 12)) 
-        editor_pane.setMargin(Insets(0,0,0,0))
         
-        # CSS for Swing HTML Renderer
-        style = """
-        body { font-family: Segoe UI, sans-serif; font-size: 11px; margin: 8px; color: #2d2d2d; }
-        h1, h2, h3 { color: #0056b3; border-bottom: 1px solid #dee2e6; padding-bottom: 4px; margin-top: 12px; margin-bottom: 8px; }
-        h1 { font-size: 14px; }
-        h2 { font-size: 13px; }
-        b { color: #212529; font-weight: bold; }
-        .code-block { background-color: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 4px; padding: 8px; margin: 8px 0; font-family: Consolas, monospaced; color: #24292e; font-size: 11px; display: block; }
-        .inline-code { background-color: #f6f8fa; border: 1px solid #eaecef; border-radius: 3px; padding: 2px 4px; font-family: Consolas, monospaced; color: #24292e; font-size: 11px; }
-        .target-box { background-color: #e9ecef; border-left: 4px solid #495057; padding: 8px; margin-bottom: 12px; font-size: 11px; }
-        ul { margin-top: 4px; margin-bottom: 4px; margin-left: 20px; }
-        li { margin-bottom: 2px; }
-        p { margin-top: 4px; margin-bottom: 4px; }
-        """
-
-        html = "<html><head><style>" + style + "</style></head><body>"
+        # [FIX] Encoding: Basic HTML header
+        html = "<html><head><style>" + theme['css'] + "</style></head><body>"
         html += "<div class='target-box'>"
         html += "<b>TARGET:</b> " + self._escape_html(url) + "<br>"
         html += "<b>MODEL:</b> " + self._escape_html(model_name)
@@ -1733,11 +2046,89 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         editor_pane.setText(html)
         editor_pane.setCaretPosition(0)
         
-        scroll = JScrollPane(editor_pane)
-        scroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED)
-        scroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED) 
+        pretty_scroll = JScrollPane(editor_pane)
+        pretty_scroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED)
+        pretty_scroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED) 
+        pretty_scroll.setBorder(None) 
         
-        self._result_tabs.addTab(title, scroll)
+        # --- 2. RAW VIEW (TEXT) ---
+        raw_area = JTextArea()
+        raw_area.setEditable(False)
+        raw_area.setText(report_text)
+        raw_area.setFont(Font("Monospaced", Font.PLAIN, 12))
+        raw_area.setLineWrap(True)
+        raw_area.setWrapStyleWord(True)
+        raw_area.setCaretPosition(0)
+        
+        # [NEW] Bind Data for Export (Raw Tab)
+        raw_area.putClientProperty("full_url", url)
+        raw_area.putClientProperty("report", report_text)
+        raw_area.putClientProperty("model", model_name)
+        raw_area.putClientProperty("time", time)
+        raw_area.addMouseListener(ResultTabMouseListener(self))
+        
+        # Apply simple dark mode for raw text area if needed
+        if theme['is_dark']:
+            raw_area.setBackground(theme['bg_panel'])
+            raw_area.setForeground(Color(220, 220, 220))
+        
+        raw_scroll = JScrollPane(raw_area)
+        raw_scroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED)
+        raw_scroll.setBorder(None)
+        
+        # --- 3. CONTAINER ---
+        content_panel = JPanel(BorderLayout())
+        
+        # Card Layout for Switching
+        card_panel = JPanel(CardLayout())
+        card_panel.add(pretty_scroll, "PRETTY")
+        card_panel.add(raw_scroll, "RAW")
+        
+        # --- 4. MODERN TAB BAR UI ---
+        # Styled Tab Bar Panel
+        tab_bar = JPanel(FlowLayout(FlowLayout.LEFT, 20, 8))
+        tab_bar.setBackground(theme['bg_panel']) # [FIX] Dynamic Background
+        tab_bar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, theme['border_color'])) # [FIX] Dynamic Border
+        
+        # Helper to create clean tab buttons
+        def create_tab_btn(text, is_selected):
+            btn = JButton(text)
+            btn.setBorder(None)
+            btn.setContentAreaFilled(False)
+            btn.setFocusPainted(False)
+            btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
+            if is_selected:
+                btn.setFont(Font("Segoe UI", Font.BOLD, 12))
+                btn.setForeground(theme['text_active']) # [FIX] Dynamic Color
+            else:
+                btn.setFont(Font("Segoe UI", Font.PLAIN, 12))
+                btn.setForeground(theme['text_normal']) # [FIX] Dynamic Color
+            return btn
+
+        btn_pretty = create_tab_btn("Pretty", True)
+        btn_raw = create_tab_btn("Raw", False)
+        
+        # Update function
+        def switch_to(view_name, btn_active, btn_inactive):
+            card_panel.getLayout().show(card_panel, view_name)
+            
+            # Update Styles
+            btn_active.setFont(Font("Segoe UI", Font.BOLD, 12))
+            btn_active.setForeground(theme['text_active']) 
+            
+            btn_inactive.setFont(Font("Segoe UI", Font.PLAIN, 12))
+            btn_inactive.setForeground(theme['text_normal'])
+
+        btn_pretty.addActionListener(lambda e: switch_to("PRETTY", btn_pretty, btn_raw))
+        btn_raw.addActionListener(lambda e: switch_to("RAW", btn_raw, btn_pretty))
+        
+        tab_bar.add(btn_pretty)
+        tab_bar.add(btn_raw)
+        
+        content_panel.add(tab_bar, BorderLayout.NORTH)
+        content_panel.add(card_panel, BorderLayout.CENTER)
+        
+        self._result_tabs.addTab(title, content_panel)
 
     def _render_markdown_to_html(self, text):
         html = ""
@@ -1807,7 +2198,166 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         if in_code_block: html += "</div>" # Close dangling code block
         return html
 
-    # --- 8. REGISTRATION ---
+    # --- 8. EXPORT / IMPORT ---
+    def export_scan_data(self, nodes):
+        if not nodes: return
+        
+        # Ensure input is a list
+        if not isinstance(nodes, list):
+            nodes = [nodes]
+
+        urls_to_export = set()
+        
+        # Helper to recursively collect URLs
+        def traverse(n):
+            obj = n.getUserObject()
+            if hasattr(obj, 'type') and obj.type == "file" and obj.url:
+                urls_to_export.add(obj.url)
+            
+            # Recurse children
+            for i in range(n.getChildCount()):
+                traverse(n.getChildAt(i))
+        
+        # Traverse all selected nodes
+        for node in nodes:
+            traverse(node)
+        
+        if not urls_to_export:
+            JOptionPane.showMessageDialog(None, "No scan data found to export in this scope.")
+            return
+            
+        # Collect History
+        export_list = []
+        for url in urls_to_export:
+            history = self._scan_history.get(url, [])
+            export_list.extend(history)
+            
+        if not export_list:
+             JOptionPane.showMessageDialog(None, "Nodes exist but no scan history found.")
+             return
+
+        self._save_records_to_json(export_list)
+
+    def _save_records_to_json(self, export_list):
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Export Scan Results (JSON)")
+        chooser.setSelectedFile(File("scan_results.json")) # Use java.io.File
+        chooser.setFileFilter(FileNameExtensionFilter("JSON Files", "json"))
+        
+        if chooser.showSaveDialog(None) == JFileChooser.APPROVE_OPTION:
+            try:
+                f = chooser.getSelectedFile()
+                base_path = f.getAbsolutePath()
+                if not base_path.lower().endswith(".json"): base_path += ".json"
+                
+                # [NEW] Split Logic
+                MAX_RECORDS_PER_FILE = 500
+                total_records = len(export_list)
+                
+                if total_records > MAX_RECORDS_PER_FILE:
+                    # Split into chunks
+                    chunks = [export_list[i:i + MAX_RECORDS_PER_FILE] for i in range(0, total_records, MAX_RECORDS_PER_FILE)]
+                    
+                    saved_files = []
+                    base_name = base_path[:-5] # Remove .json
+                    
+                    for idx, chunk in enumerate(chunks):
+                        part_path = "{}_part{}.json".format(base_name, idx + 1)
+                        with open(part_path, 'w') as outfile:
+                            json.dump(chunk, outfile, indent=4)
+                        saved_files.append(part_path)
+                        
+                    JOptionPane.showMessageDialog(None, "Large dataset split into {} files!\nSaved to:\n{}".format(len(chunks), "\n".join(saved_files)))
+                else:
+                    # Normal Save
+                    with open(base_path, 'w') as outfile:
+                        json.dump(export_list, outfile, indent=4)
+                    JOptionPane.showMessageDialog(None, "Export Successful!\nSaved {} records to: {}".format(total_records, base_path))
+                    
+            except Exception as e:
+                self.log_system("Export Error: " + str(e), True)
+                JOptionPane.showMessageDialog(None, "Export Failed: " + str(e))
+
+    def import_scan_data(self, event=None):
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Import Scan Results (JSON)")
+        chooser.setFileFilter(FileNameExtensionFilter("JSON Files", "json")) # [SEC] File Filter
+        chooser.setAcceptAllFileFilterUsed(False)
+        chooser.setMultiSelectionEnabled(True) # [NEW] Enable key feature
+        
+        if chooser.showOpenDialog(None) == JFileChooser.APPROVE_OPTION:
+            files = chooser.getSelectedFiles()
+            
+            # [NEW] Limit number of files
+            if len(files) > 3:
+                JOptionPane.showMessageDialog(None, "Limit Exceeded: You can select a maximum of 3 files.")
+                return
+
+            total_imported = 0
+            total_errors = 0
+            skipped_files = []
+
+            for f in files:
+                # [NEW] Limit file size (5MB)
+                if f.length() > 5 * 1024 * 1024:
+                    skipped_files.append("{} (Size > 5MB)".format(f.getName()))
+                    continue
+
+                try:
+                    path = f.getAbsolutePath()
+                    # Safe Read
+                    with codecs.open(path, 'r', 'utf-8') as infile:
+                        data = json.load(infile)
+                    
+                    if not isinstance(data, list):
+                        self.log_system("Skipping invalid JSON format: " + f.getName())
+                        total_errors += 1
+                        continue
+
+                    # Process Items
+                    for item in data:
+                        if 'full_url' not in item or 'report' not in item: 
+                            total_errors += 1
+                            continue
+                        
+                        # Add to history
+                        url = item['full_url']
+                        if url not in self._scan_history: self._scan_history[url] = []
+                        
+                        # De-dupe check within history
+                        exists = False
+                        for h in self._scan_history[url]:
+                            if h['time'] == item['time'] and h['model'] == item.get('model'):
+                                exists = True; break
+                        
+                        if not exists:
+                            self._scan_history[url].append(item)
+                            # Add to tree
+                            self.add_scan_result_to_tree_struct(
+                                url, 
+                                item['report'], 
+                                item.get('model', 'Imported'), 
+                                item['time'] # Use original time
+                            )
+                            total_imported += 1
+                            
+                except Exception as e:
+                    self.log_system("Error importing {}: {}".format(f.getName(), str(e)), True)
+                    total_errors += 1
+            
+            msg = "Import Completed!\nImported: {} records.".format(total_imported)
+            if skipped_files:
+                msg += "\nSkipped Large Files:\n" + "\n".join(skipped_files)
+            if total_errors > 0:
+                msg += "\nErrors/Duplicates encountered: {}".format(total_errors)
+                
+            JOptionPane.showMessageDialog(None, msg)
+            
+            # Refresh tabs if we are currently viewing one of the imported URLs
+            if self._current_selected_url and self._current_selected_url in self._scan_history:
+                 self._refresh_tabs_for_current_node()
+
+    # --- 9. REGISTRATION ---
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
