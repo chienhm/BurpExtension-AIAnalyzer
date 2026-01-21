@@ -1387,14 +1387,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
         # Import Button
         thc.gridx = 2
-        btn_import = JButton("Import Sitemap")
+        btn_import = JButton("Import")
         btn_import.setMargin(Insets(2, 5, 2, 5))
         btn_import.addActionListener(self.import_scan_data)
         tree_header.add(btn_import, thc)
         
         # Clear Button
         thc.gridx = 3
-        btn_clean = JButton("Clear Sitemap")
+        btn_clean = JButton("Clear")
         btn_clean.setMargin(Insets(2, 5, 2, 5))
         btn_clean.addActionListener(self._action_clear_sitemap)
         tree_header.add(btn_clean, thc)
@@ -1716,7 +1716,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             self._processing_menu = False
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        if toolFlag == IBurpExtenderCallbacks.TOOL_EXTENDER: return
+        # [MODIFIED] Only Allow Proxy Traffic (Browser)
+        if toolFlag != IBurpExtenderCallbacks.TOOL_PROXY: return
+        
         if messageIsRequest: return
         if not self._chk_enable.isSelected(): return
 
